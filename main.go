@@ -77,6 +77,14 @@ func getToken(t string) string {
 func check(cert, ckey, alert string, interval int, token string) {
 	certs, err := getCert(cert, ckey)
 	if err != nil {
+		if strings.Contains(err.Error(), "expired") {
+			if strings.Contains(alert, "@") {
+				sendEmail(alert, err.Error())
+			} else {
+				sendNotification(alert, err.Error(), token)
+			}
+			return
+		}
 		log.Fatalf("Unable to read certificate cert=%s, ckey=%s, error=%v", cert, ckey, err)
 	}
 	tsCert := CertExpire(certs)
@@ -146,6 +154,9 @@ func sendEmail(to, body string) {
 
 // helper function to send notification
 func sendNotification(apiURL, msg, token string) {
+	if apiURL == "" {
+		log.Fatal("Unable to POST request to empty URL, please provide valid URL for alert option")
+	}
 	var headers [][]string
 	bearer := fmt.Sprintf("Bearer %s", token)
 	headers = append(headers, []string{"Authorization", bearer})
