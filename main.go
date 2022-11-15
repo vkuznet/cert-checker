@@ -47,7 +47,7 @@ func main() {
 	var httpPort int
 	flag.IntVar(&httpPort, "httpPort", 0, "start http server with provided http port")
 	var httpBase string
-	flag.StringVar(&httpBase, "httpBase", "/", "http base path")
+	flag.StringVar(&httpBase, "httpBase", "", "http base path")
 	flag.Parse()
 	if version {
 		fmt.Println(info())
@@ -66,13 +66,13 @@ func main() {
 			certs, err := getCert(cert, ckey)
 			if err != nil {
 				log.Println("unable to get certificate info", err)
-				w.WriteHeader(http.StatusInternalServerError)
-				return
+				//                             w.WriteHeader(http.StatusInternalServerError)
+				//                             return
 			}
 			tsCert := CertExpire(certs)
-			out := fmt.Sprintf("# HELP cert_ts\n")
-			out += fmt.Sprintf("# TYPE cert_ts gauge\n")
-			out += fmt.Sprintf("cert_ts %v\n", tsCert.Sub(time.Now()).Seconds())
+			out := fmt.Sprintf("# HELP cert_valid_sec\n")
+			out += fmt.Sprintf("# TYPE cert_valid_sec gauge\n")
+			out += fmt.Sprintf("cert_valid_sec %v\n", tsCert.Sub(time.Now()).Seconds())
 			w.Write([]byte(out))
 		})
 		http.ListenAndServe(fmt.Sprintf(":%d", httpPort), nil)
