@@ -44,6 +44,10 @@ func main() {
 	flag.IntVar(&daemonInterval, "daemon", 0, "run as daemon with provided interval value")
 	var token string
 	flag.StringVar(&token, "token", "", "token string or file containing the token")
+	var httpPort int
+	flag.IntVar(&httpPort, "httpPort", 0, "start http server with provided http port")
+	var httpBase string
+	flag.StringVar(&httpBase, "httpBase", "/", "http base path")
 	flag.Parse()
 	if version {
 		fmt.Println(info())
@@ -56,6 +60,22 @@ func main() {
 			check(cert, ckey, alert, interval, token)
 			time.Sleep(time.Duration(daemonInterval) * time.Second)
 		}
+	} else if httpPort > 0 {
+		path := fmt.Sprintf("%s/metrics", httpBase)
+		http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			certs, err := getCert(cert, ckey)
+			if err != nil {
+				log.Println("unable to get certificate info", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			tsCert := CertExpire(certs)
+			out := fmt.Sprintf("# HELP cert_ts\n")
+			out += fmt.Sprintf("# TYPE cert_ts gauge\n")
+			out += fmt.Sprintf("cert_ts %v\n", tsCert.Sub(time.Now()).Seconds())
+			w.Write([]byte(out))
+		})
+		http.ListenAndServe(fmt.Sprintf(":%d", httpPort), nil)
 	} else {
 		check(cert, ckey, alert, interval, token)
 	}
