@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -11,11 +12,13 @@ import (
 	"net/http"
 	"net/smtp"
 	"os"
+	"os/exec"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/vkuznet/x509proxy"
+	"gopkg.in/jcmturner/gokrb5.v8/keytab"
 )
 
 // version of the code
@@ -30,6 +33,8 @@ func info() string {
 
 // main function
 func main() {
+	var keytab string
+	flag.StringVar(&keytab, "keytab", "", "keytab file to check")
 	var cert string
 	flag.StringVar(&cert, "cert", "", "file certificate (PEM file name) or X509 proxy")
 	var ckey string
@@ -40,6 +45,8 @@ func main() {
 	flag.IntVar(&interval, "interval", 600, "interval before expiration (in seconds)")
 	var version bool
 	flag.BoolVar(&version, "version", false, "print version information about the server")
+	var verbose bool
+	flag.BoolVar(&verbose, "verbose", false, "print verbose information")
 	var daemonInterval int
 	flag.IntVar(&daemonInterval, "daemon", 0, "run as daemon with provided interval value")
 	var token string
@@ -57,17 +64,30 @@ func main() {
 	token = getToken(token)
 	if daemonInterval > 0 {
 		for {
-			check(cert, ckey, alert, interval, token)
+			check(cert, ckey, keytab, alert, interval, token, verbose)
 			time.Sleep(time.Duration(daemonInterval) * time.Second)
 		}
 	} else if httpPort > 0 {
 		path := fmt.Sprintf("%s/metrics", httpBase)
 		http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			if keytab != "" {
+				ts, err := keytabExpire(keytab, interval, verbose)
+				if err != nil {
+					log.Println("unable to get keytab info", err)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				out := fmt.Sprintf("# HELP keytab_valid_sec\n")
+				out += fmt.Sprintf("# TYPE keytab_valid_sec gauge\n")
+				out += fmt.Sprintf("keytab_valid_sec %v\n", ts.Sub(time.Now()).Seconds())
+				w.Write([]byte(out))
+				return
+			}
 			certs, err := getCert(cert, ckey)
 			if err != nil {
 				log.Println("unable to get certificate info", err)
-				//                             w.WriteHeader(http.StatusInternalServerError)
-				//                             return
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			tsCert := CertExpire(certs)
 			out := fmt.Sprintf("# HELP cert_valid_sec\n")
@@ -77,7 +97,7 @@ func main() {
 		})
 		http.ListenAndServe(fmt.Sprintf(":%d", httpPort), nil)
 	} else {
-		check(cert, ckey, alert, interval, token)
+		check(cert, ckey, keytab, alert, interval, token, verbose)
 	}
 }
 
@@ -94,7 +114,22 @@ func getToken(t string) string {
 }
 
 // check given cert/key or X509 proxy for its expiration in time+interval range
-func check(cert, ckey, alert string, interval int, token string) {
+func check(cert, ckey, keytab, alert string, interval int, token string, verbose bool) {
+	if keytab != "" {
+		ts, err := keytabExpire(keytab, interval, verbose)
+		if ts.Sub(time.Now()).Seconds() < 0 || err != nil {
+			msg := fmt.Sprintf("Keytab file '%s' has expired on %v", keytab, ts)
+			if err != nil {
+				msg = fmt.Sprintf("Unable to check keytab file '%s', error %v", keytab, err)
+			}
+			if strings.Contains(alert, "@") {
+				sendEmail(alert, msg)
+			} else {
+				sendNotification(alert, msg, token)
+			}
+		}
+		return
+	}
 	certs, err := getCert(cert, ckey)
 	if err != nil {
 		if strings.Contains(err.Error(), "expired") {
@@ -202,4 +237,59 @@ func sendNotification(apiURL, msg, token string) {
 		log.Printf("Unable to send notication to %s", apiURL)
 		return
 	}
+}
+
+// helper function to read keytab file and return its timestamp
+func keytabExpire(krbFile string, interval int, verbose bool) (time.Time, error) {
+	ktab, err := keytab.Load(krbFile)
+	if err != nil {
+		return time.Now(), err
+	}
+	var ets time.Time
+	for _, e := range ktab.Entries {
+		ts := e.Timestamp
+		// we have 1 year accounts and would like to check if
+		// keytab is expired in a future, so we do
+		// keytab timestamp + 1 year - interval in seconds
+		yearSecs := 365 * 24 * 60 * 60
+		ets = ts.Add(time.Duration(yearSecs-interval) * time.Second)
+		// secSinceCreation := ts.Sub(time.Now()).Seconds()
+		if verbose {
+			log.Println("### keytab entry", ts, "expire", ets)
+		}
+		if ets.Sub(time.Now()).Seconds() < 0 {
+			msg := fmt.Sprintf("keytab %s has expired, it was created on %v", krbFile, ts)
+			return ts, errors.New(msg)
+		}
+	}
+	return ets, nil
+}
+
+// helper function to check keytab expiration
+func keytabExpireCommand(keytab string, interval int, verbose bool) (time.Time, error) {
+	out, err := exec.Command("klist", "-t", "-k", keytab).Output()
+	if err != nil {
+		return time.Now(), err
+	}
+	/* here is example of output of klist command
+	klist -t -k agg.keytab
+	Keytab name: FILE:agg.keytab
+	KVNO Timestamp           Principal
+	---- ------------------- ------------------------------------------------------
+	   1 11/16/2022 14:34:08 xxx@CERN.CH
+	   1 11/16/2022 14:34:08 xxx@CERN.CH
+	*/
+	for _, v := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(v, "Keytab") || strings.HasPrefix(v, "KVNO") || strings.HasPrefix(v, "-") {
+			continue
+		}
+		v = strings.Trim(v, " ")
+		arr := strings.Split(v, " ")
+		// we need 2nd and 3rd fields to construct timestamp
+		ts := strings.Trim(strings.Join(arr[1:3], " "), " ")
+		const layout = "01/02/2006 03:04:05"
+		t, err := time.Parse(layout, ts)
+		return t, err
+	}
+	return time.Now(), nil
 }
