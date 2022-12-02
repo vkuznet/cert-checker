@@ -7,7 +7,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/smtp"
@@ -33,8 +32,8 @@ func info() string {
 
 // main function
 func main() {
-	var keytab string
-	flag.StringVar(&keytab, "keytab", "", "keytab file to check")
+	var keytabFile string
+	flag.StringVar(&keytabFile, "keytab", "", "keytabFile file to check")
 	var cert string
 	flag.StringVar(&cert, "cert", "", "file certificate (PEM file name) or X509 proxy")
 	var ckey string
@@ -55,6 +54,10 @@ func main() {
 	flag.IntVar(&httpPort, "httpPort", 0, "start http server with provided http port")
 	var httpBase string
 	flag.StringVar(&httpBase, "httpBase", "", "http base path")
+	var configFile string
+	flag.StringVar(&configFile, "config", "", "read inputs from json config file")
+	var teamName string
+	flag.StringVar(&teamName, "team", "", "read inputs from json config file")
 	flag.Parse()
 	if version {
 		fmt.Println(info())
@@ -62,18 +65,32 @@ func main() {
 	}
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	token = getToken(token)
-	if daemonInterval > 0 {
+	if configFile != "" {
+		err := ParseConfig(configFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		path := fmt.Sprintf("%s/metrics", httpBase)
+		http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			var out string
+			for _, c := range Configs {
+				out += checkAndGetPromMetrics(c.Cert, c.Ckey, c.Keytab, teamName, interval, verbose)
+			}
+			w.Write([]byte(out))
+		})
+		http.ListenAndServe(fmt.Sprintf(":%d", httpPort), nil)
+	} else if daemonInterval > 0 {
 		for {
-			check(cert, ckey, keytab, alert, interval, token, verbose)
+			check(cert, ckey, keytabFile, alert, interval, token, verbose)
 			time.Sleep(time.Duration(daemonInterval) * time.Second)
 		}
 	} else if httpPort > 0 {
 		path := fmt.Sprintf("%s/metrics", httpBase)
 		http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-			if keytab != "" {
-				ts, err := keytabExpire(keytab, interval, verbose)
+			if keytabFile != "" {
+				ts, _, err := keytabExpire(keytabFile, interval, verbose)
 				if err != nil {
-					log.Println("unable to get keytab info", err)
+					log.Println("unable to get keytabFile info", err)
 					w.WriteHeader(http.StatusInternalServerError)
 					return
 				}
@@ -89,7 +106,7 @@ func main() {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
-			tsCert := CertExpire(certs)
+			tsCert, _ := CertExpire(certs)
 			out := fmt.Sprintf("# HELP cert_valid_sec\n")
 			out += fmt.Sprintf("# TYPE cert_valid_sec gauge\n")
 			out += fmt.Sprintf("cert_valid_sec %v\n", tsCert.Sub(time.Now()).Seconds())
@@ -97,14 +114,48 @@ func main() {
 		})
 		http.ListenAndServe(fmt.Sprintf(":%d", httpPort), nil)
 	} else {
-		check(cert, ckey, keytab, alert, interval, token, verbose)
+		check(cert, ckey, keytabFile, alert, interval, token, verbose)
+	}
+}
+
+// // helper function to check and return promql metric entries
+func checkAndGetPromMetrics(cert, ckey, keytab, team string, interval int, verbose bool) string {
+	if keytab != "" {
+		fileName := keytab[strings.LastIndex(keytab, "/")+1:]
+		ts, principle, err := keytabExpire(keytab, interval, verbose)
+		if err != nil {
+			log.Println("unable to get keytab info", err)
+			return ""
+		}
+		out := fmt.Sprintf("# HELP keytab_valid_sec\n")
+		out += fmt.Sprintf("# TYPE keytab_valid_sec gauge\n")
+		out += fmt.Sprintf(
+			"keytab_valid_sec{file_name=\"%s\", principle=\"%s\", team=\"%s\"} %v\n",
+			fileName, principle, team, ts.Sub(time.Now()).Seconds(),
+		)
+		return out
+	} else if cert != "" && ckey != "" {
+		fileName := cert[strings.LastIndex(cert, "/")+1:]
+		certs, err := getCert(cert, ckey)
+		if err != nil {
+			log.Println("unable to get certificate info", err)
+			return ""
+		}
+		tsCert, certCommonName := CertExpire(certs)
+		out := fmt.Sprintf("# HELP cert_valid_sec\n")
+		out += fmt.Sprintf("# TYPE cert_valid_sec gauge\n")
+		out += fmt.Sprintf("cert_valid_sec{file_name=\"%s\", common_name=\"%s\" team=\"%s\"} %v\n",
+			fileName, certCommonName, team, tsCert.Sub(time.Now()).Seconds())
+		return out
+	} else {
+		return ""
 	}
 }
 
 // helper function to get token
 func getToken(t string) string {
 	if _, err := os.Stat(t); err == nil {
-		b, e := ioutil.ReadFile(t)
+		b, e := os.ReadFile(t)
 		if e != nil {
 			log.Fatalf("Unable to read data from file: %s, error: %s", t, e)
 		}
@@ -116,7 +167,7 @@ func getToken(t string) string {
 // check given cert/key or X509 proxy for its expiration in time+interval range
 func check(cert, ckey, keytab, alert string, interval int, token string, verbose bool) {
 	if keytab != "" {
-		ts, err := keytabExpire(keytab, interval, verbose)
+		ts, _, err := keytabExpire(keytab, interval, verbose)
 		if ts.Sub(time.Now()).Seconds() < 0 || err != nil {
 			msg := fmt.Sprintf("Keytab file '%s' has expired on %v", keytab, ts)
 			if err != nil {
@@ -142,7 +193,7 @@ func check(cert, ckey, keytab, alert string, interval int, token string, verbose
 		}
 		log.Fatalf("Unable to read certificate cert=%s, ckey=%s, error=%v", cert, ckey, err)
 	}
-	tsCert := CertExpire(certs)
+	tsCert, _ := CertExpire(certs)
 	ts := time.Now().Add(time.Duration(interval) * time.Second)
 	if tsCert.Before(ts) {
 		msg := fmt.Sprintf("certificate timestamp: %v will expire soon", tsCert)
@@ -178,16 +229,18 @@ func getCert(cert, ckey string) ([]tls.Certificate, error) {
 }
 
 // CertExpire gets minimum certificate expire from list of certificates
-func CertExpire(certs []tls.Certificate) time.Time {
+func CertExpire(certs []tls.Certificate) (time.Time, string) {
 	var notAfter time.Time
+	var certCommonName string
 	for _, cert := range certs {
 		c, e := x509.ParseCertificate(cert.Certificate[0])
+		certCommonName = strings.Replace(c.Subject.CommonName, "\n", "", -1)
 		if e == nil {
 			notAfter = c.NotAfter
 			break
 		}
 	}
-	return notAfter
+	return notAfter, certCommonName
 }
 
 // helper function to send email
@@ -240,13 +293,15 @@ func sendNotification(apiURL, msg, token string) {
 }
 
 // helper function to read keytab file and return its timestamp
-func keytabExpire(krbFile string, interval int, verbose bool) (time.Time, error) {
+func keytabExpire(krbFile string, interval int, verbose bool) (time.Time, string, error) {
 	ktab, err := keytab.Load(krbFile)
 	if err != nil {
-		return time.Now(), err
+		return time.Now(), "", err
 	}
 	var ets time.Time
+	var principle string
 	for _, e := range ktab.Entries {
+		principle = strings.Join(e.Principal.Components, ",")
 		ts := e.Timestamp
 		// we have 1 year accounts and would like to check if
 		// keytab is expired in a future, so we do
@@ -255,14 +310,14 @@ func keytabExpire(krbFile string, interval int, verbose bool) (time.Time, error)
 		ets = ts.Add(time.Duration(yearSecs-interval) * time.Second)
 		// secSinceCreation := ts.Sub(time.Now()).Seconds()
 		if verbose {
-			log.Println("### keytab entry", ts, "expire", ets)
+			log.Println("### keytab entry", ts, "expire", ets, "principle", principle)
 		}
 		if ets.Sub(time.Now()).Seconds() < 0 {
 			msg := fmt.Sprintf("keytab %s has expired, it was created on %v", krbFile, ts)
-			return ts, errors.New(msg)
+			return ts, principle, errors.New(msg)
 		}
 	}
-	return ets, nil
+	return ets, principle, nil
 }
 
 // helper function to check keytab expiration
@@ -272,12 +327,12 @@ func keytabExpireCommand(keytab string, interval int, verbose bool) (time.Time, 
 		return time.Now(), err
 	}
 	/* here is example of output of klist command
-	klist -t -k agg.keytab
-	Keytab name: FILE:agg.keytab
-	KVNO Timestamp           Principal
-	---- ------------------- ------------------------------------------------------
-	   1 11/16/2022 14:34:08 xxx@CERN.CH
-	   1 11/16/2022 14:34:08 xxx@CERN.CH
+	   klist -t -k agg.keytab
+	   Keytab name: FILE:agg.keytab
+	   KVNO Timestamp           Principal
+	   ---- ------------------- ------------------------------------------------------
+	      1 11/16/2022 14:34:08 xxx@CERN.CH
+	      1 11/16/2022 14:34:08 xxx@CERN.CH
 	*/
 	for _, v := range strings.Split(string(out), "\n") {
 		if strings.HasPrefix(v, "Keytab") || strings.HasPrefix(v, "KVNO") || strings.HasPrefix(v, "-") {

@@ -1,0 +1,9 @@
+[
+    {
+        "cert": "/Users/x/usercert.pem",
+        "ckey": "/Users/y/userkey.pem"
+    },
+    {
+        "keytab": "/Users/x/keytab"
+    }
+]
