@@ -1,10 +1,10 @@
 module github.com/vkuznet/cert-checker
 
-go 1.19
+go 1.20
 
 require (
 	github.com/vkuznet/x509proxy v0.0.0-20210801171832-e47b94db99b6
-	gopkg.in/jcmturner/gokrb5.v8 v8.4.3
+	gopkg.in/jcmturner/gokrb5.v8 v8.4.4
 )
 
 require (
